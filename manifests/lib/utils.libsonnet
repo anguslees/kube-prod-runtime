@@ -85,4 +85,13 @@ local kube = import "kube.libsonnet";
       }],
     },
   },
+
+  Issuer(name):: kube._Object("certmanager.k8s.io/v1alpha1", "Issuer", name) {
+  },
+
+  ClusterIssuer(name):: kube._Object("certmanager.k8s.io/v1alpha1", "ClusterIssuer", name) {
+  },
+
+  ClusterServiceBroker(name): kube._Object("servicecatalog.k8s.io/v1beta1", "ClusterServiceBroker", name) {
+  },
 }
