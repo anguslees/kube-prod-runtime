@@ -19,6 +19,35 @@
 
 local kube = import "../lib/kube.libsonnet";
 local CERT_MANAGER_IMAGE = (import "images.json")["cert-manager"];
+local CERT_MANAGER_WEBHOOK_IMAGE = (import "images.json")["cert-manager-webhook"];
+
+// TODO(gus): move to kube.libsonnet
+local APIService(group, version) = {
+  local this = self,
+  service_:: error "service_ is required",
+
+  apiVersion: "apiregistration.k8s.io/v1beta1",
+  kind: "APIService",
+  metadata+: {
+    name: "%s.%s" % [this.spec.version, this.spec.group],
+  },
+  spec+: {
+    group: group,
+    version: version,
+    service: {
+      namespace: this.service_.metadata.namespace,
+      name: this.service_.metadata.name,
+    },
+    // arbitrary conservative default priorities
+    groupPriorityMinimum: 1000,
+    versionPriority: 15,
+  },
+};
+
+// TODO(gus): move to kube.libsonnet
+local ValidatingWebhookConfiguration(name) = kube._Object("admissionregistration.k8s.io/v1beta1", "ValidatingWebhookConfiguration", name) {
+  webhooks: [],
+};
 
 {
   p:: "",
@@ -43,9 +72,11 @@ local CERT_MANAGER_IMAGE = (import "images.json")["cert-manager"];
   ClusterIssuer(name):: kube._Object("certmanager.k8s.io/v1alpha1", "ClusterIssuer", name) {
   },
 
+  Certificate(name):: kube._Object("certmanager.k8s.io/v1alpha1", "Certificate", name) {
+  },
+
   certCRD: kube.CustomResourceDefinition("certmanager.k8s.io", "v1alpha1", "Certificate") {
     spec+: { names+: { shortNames+: ["cert", "certs"] } },
-
   },
 
   issuerCRD: kube.CustomResourceDefinition("certmanager.k8s.io", "v1alpha1", "Issuer"),
@@ -123,6 +154,268 @@ local CERT_MANAGER_IMAGE = (import "images.json")["cert-manager"];
                 requests: {cpu: "10m", memory: "32Mi"},
               },
             },
+          },
+        },
+      },
+    },
+  },
+
+  webhook: {
+    local p = $.p + "cm-webhook",
+
+    sa: kube.ServiceAccount(p) + $.metadata,
+
+    requesterRole: kube.ClusterRole(p+"-requester") {
+      rules: [{
+        apiGroups: ["admission.certmanager.k8s.io"],
+        resources: ["certificates", "issuers", "clusterissuers"],
+        verbs: ["create"],
+      }],
+    },
+
+    clusterRoleBinding: kube.ClusterRoleBinding(p+"-auth-delegator") {
+      roleRef: {
+        apiGroup: "rbac.authorization.k8s.io",
+        kind: "ClusterRole",
+        name: "system:auth-delegator",
+      },
+      subjects_+: [$.webhook.sa],
+    },
+
+    roleBinding: kube.RoleBinding(p+"-auth-reader") + $.metadata {
+      roleRef: {
+        apiGroup: "rbac.authorization.k8s.io",
+        kind: "Role",
+        name: "extension-apiserver-authentication-reader",
+      },
+      subjects_+: [$.webhook.sa],
+    },
+
+    svc: kube.Service(p) + $.metadata {
+      port: 443,
+      target_pod: $.webhook.deploy.spec.template,
+    },
+
+    deploy: kube.Deployment(p) + $.metadata {
+      spec+: {
+        template+: {
+          spec+: {
+            serviceAccountName: $.webhook.sa.metadata.name,
+            volumes_+: {
+              certs: kube.SecretVolume(p + "-tls"),
+            },
+            containers_+: {
+              webhook: kube.Container("webhook") {
+                image: CERT_MANAGER_WEBHOOK_IMAGE,
+                args_+: {
+                  v: "12",
+                  "tls-cert-file": "/certs/tls.crt",
+                  "tls-private-key-file": "/certs/tls.key",
+                  "disable-admission-plugins": "NamespaceLifecycle,MutatingAdmissionWebhook,ValidatingAdmissionWebhook,Initializers",
+                },
+                env_+: {
+                  POD_NAMESPACE: kube.FieldRef("metadata.namespace"),
+                },
+                resources+: {
+                  requests: {cpu: "10m", memory: "32Mi"},
+                },
+                volumeMounts_+: {
+                  certs: {mountPath: "/certs", readOnly: true},
+                },
+              },
+            },
+          },
+        },
+      },
+    },
+
+    apiservice: APIService("admission.certmanager.k8s.io", "v1beta1") {
+      service_: $.webhook.svc,
+      // NB: spec.caBundle is set by caSync job
+    },
+
+    selfsign: $.Issuer(p+"-selfsign") + $.namespace {
+      metadata+: {
+        annotations+: {
+          "certmanager.k8s.io/disable-validation": "true",
+        },
+      },
+      spec+: {
+        selfsigned: {},
+      },
+    },
+
+    caCert: $.Certificate(p+"-ca") + $.metadata {
+      local this = self,
+      metadata+: {
+        annotations+: {
+          "certmanager.k8s.io/disable-validation": "true",
+        },
+      },
+      spec+: {
+        secretName: this.metadata.name,
+        issuerRef: {name: $.webhook.selfsign.metadata.name},
+        commonName: "ca.webhook.cert-manager",
+        isCA: true,
+      },
+    },
+
+    caIssuer: $.Issuer(p+"-ca") + $.metadata {
+      metadata+: {
+        annotations+: {
+          "certmanager.k8s.io/disable-validation": "true",
+        },
+      },
+      spec+: {
+        ca: {secretName: $.webhook.caCert.spec.secretName},
+      },
+    },
+
+    cert: $.Certificate(p+"-tls") + $.metadata {
+      local this = self,
+      spec+: {
+        secretName: this.metadata.name,
+        issuerRef: {name: $.webhook.caIssuer.metadata.name},
+        local svc = $.webhook.svc,
+        dnsNames: [
+          svc.metadata.name,
+          "%s.%s" % [svc.metadata.name, svc.metadata.namespace],
+          svc.host,
+        ],
+      },
+    },
+
+    validatingWebhook: ValidatingWebhookConfiguration(p) {
+      webhooks: [
+        {
+          name: resource + ".admission.certmanager.k8s.io",
+          namespaceSelector: {
+            // NB! the actual namespace object of webhook certificate
+            // (and friends) must be excluded here to allow webhook to
+            // bootstrap.
+            matchExpressions: [
+              {
+                key: "certmanager.k8s.io/disable-validation",
+                operator: "NotIn",
+                values: ["true"],
+              },
+              {
+                key: "name",
+                operator: "NotIn",
+                values: [$.webhook.caCert.metadata.namespace],
+              },
+            ],
+          },
+          rules: [{
+            apiGroups: ["certmanager.k8s.io"],
+            apiVersions: ["v1alpha1"],
+            operations: ["CREATE", "UPDATE"],
+            resources: [resource],
+          }],
+          failurePolicy: "Fail",
+          clientConfig: {
+            service: {
+              name: "kubernetes",
+              namespace: "default",
+              path: "/apis/admission.certmanager.k8s.io/v1beta1/" + resource,
+            },
+          },
+        }
+        for resource in ["certificates", "issuers", "clusterissuers"]
+      ],
+    },
+
+    caSync: {
+      local p = $.p + "cm-webhook-ca-sync",
+
+      config: kube.ConfigMap(p) + $.metadata {
+        data+: {
+          config_:: {
+            apiServices: [{
+              name: $.webhook.apiservice.metadata.name,
+              secret: {
+                local ca = $.webhook.ca,
+                name: ca.spec.secretName,
+                namespace: ca.metadata.namespace,
+                key: "tls.crt",
+              },
+            }],
+            validatingWebhookConfigurations: [{
+              name: $.webhook.validatingWebhook.metadata.name,
+              file: {
+                path: "/var/run/secrets/kubernetes.io/serviceaccount/ca.crt",
+              },
+            }],
+          },
+          config: kubecfg.manifestJson(self.config_),
+        },
+      },
+
+      sa: kube.ServiceAccount(p) + $.metadata,
+
+      clusterRole: kube.ClusterRole(p) + $.metadata {
+        rules: [
+          {
+            apiGroups: [""],
+            resources: ["secrets"],
+            verbs: ["get"],
+            resourceNames: ["webhook-ca"],
+          },
+          {
+            apiGroups: ["admissionregistration.k8s.io"],
+            resources: ["validatingwebhookconfigurations", "mutatingwebhookconfigurations"],
+            verbs: ["get", "update"],
+            resourceNames: ["webhook"],
+          },
+          {
+            apiGroups: ["apiregistration.k8s.io"],
+            resources: ["apiservices"],
+            verbs: ["get", "update"],
+            resourceNames: ["v1beta1.admission.certmanager.k8s.io"],
+          },
+        ],
+      },
+
+      binding: kube.ClusterRoleBinding(p) + $.metadata {
+        roleRef_+: $.webhook.caSync.clusterRole,
+        subjects_+: [$.webhook.caSync.sa],
+      },
+
+      // Update the APIService caBundle once at manifest update-time
+      job: kube.Job(p) + $.metadata {
+        spec+: {
+          template+: {
+            spec+: {
+              serviceAccountName: $.webhook.caSync.sa.metadata.name,
+              volumes_+: {
+                config: kube.ConfigMap($.webhook.caSync.config),
+              },
+              containers_+: {
+                helper: kube.Container("ca-helper") {
+                  image: "quay.io/munnerz/apiextensions-ca-helper:v0.1.0",
+                  args_+: {
+                    config: "/config/config",
+                  },
+                  volumeMounts_+: {
+                    config: {mountPath: "/config", readOnly: true},
+                  },
+                  resources+: {
+                    requests: {cpu: "10m", memory: "32Mi"},
+                    limits: {cpu: "100m", memory: "128Mi"},
+                  },
+                },
+              },
+            },
+          },
+        },
+      },
+
+      // .. and re-run again periodically.
+      cronjob: kube.CronJob(p) + $.metadata {
+        spec+: {
+          schedule: "* * */24 * *",  // every 24h
+          jobTemplate+: {
+            spec+: $.webhook.caSync.job.spec,
           },
         },
       },
