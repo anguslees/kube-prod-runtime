@@ -1,0 +1,4 @@
+{
+  "dnsZone": "2886795285-kitek05.environments.katacoda.com",
+  "contactEmail": "invalid@" + self.dnsZone,
+}

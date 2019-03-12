@@ -1,0 +1,64 @@
+{
+  "title": "Bitnami Kubernetes Production Runtime lab",
+  "description": "Use BKPR in a hosted sandboxed environment",
+  "difficulty": "beginner",
+  "time": "10-15 minutes",
+  "details": {
+    "intro": {
+      "text": "intro.md",
+      "credits": "https://kubeprod.io/"
+    },
+    "steps": [
+      {
+        "title": "Step 1 - Install BKPR",
+        "text": "step-install.md"
+      },
+      {
+        "title": "Step 2 - Enjoy BKPR",
+        "text": "step-use.md"
+      },
+      {
+        "title": "Step 3 - Customize BKPR",
+        "text": "step-customize.md"
+      }
+    ],
+    "finish": {
+      "text": "finish.md"
+    },
+    "assets": {
+      "host01": [
+        {
+          "file": "platforms-katacoda.jsonnet",
+          "target": "~/"
+        },
+        {
+          "file": "kubeprod-manifest.jsonnet",
+          "target": "~/"
+        },
+        {
+          "file": "kubeprod-autogen.json",
+          "target": "~/"
+        }
+      ]
+    }
+  },
+  "environment": {
+    "uilayout": "editor-terminal",
+    "uimessage1": "\u001b[32mYour Interactive Bash Terminal.\u001b[m\r\n"
+  },
+  "dashboards": [
+    {
+      "name": "Prometheus",
+      "port": 80,
+      "host": "host01"
+    },
+    {
+      "name": "Kibana",
+      "port": 80,
+      "host": "host01"
+    }
+  ],
+  "backend": {
+    "imageid": "kubernetes-cluster-running"
+  }
+}
