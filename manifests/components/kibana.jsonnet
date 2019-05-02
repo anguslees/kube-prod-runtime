@@ -39,6 +39,7 @@ local strip_trailing_slash(s) = (
   },
 
   es: error "elasticsearch is required",
+  plugins: [],  // Kibana plugin names or URLs to install
 
   serviceAccount: kube.ServiceAccount($.p + "kibana") + $.metadata {
   },
@@ -47,8 +48,27 @@ local strip_trailing_slash(s) = (
     spec+: {
       template+: {
         spec+: {
+          local kibana_container = self.containers_.kibana,
           securityContext: {
             fsGroup: 1001,
+          },
+          volumes_: {
+            plugins: kube.EmptyDirVolume(),
+          },
+          initContainers_+: {
+            plugins: kibana_container {
+              name: "plugins",
+              command: [
+                "/bin/sh", "-c", |||
+                  set -e
+                  rm -rf plugins/lost+found
+                ||| +
+                std.join("", [
+                  "kibana-plugin install %s\n" % std.escapeStringBash(p)
+                  for p in $.plugins
+                ]),
+              ],
+            },
           },
           containers_+: {
             kibana: kube.Container("kibana") {
@@ -70,6 +90,9 @@ local strip_trailing_slash(s) = (
                 KIBANA_HOST: "0.0.0.0",
                 XPACK_MONITORING_ENABLED: "false",
                 XPACK_SECURITY_ENABLED: "false",
+              },
+              volumeMounts_+: {
+                plugins: {mountPath: "/usr/share/kibana/plugins"},
               },
               ports_+: {
                 ui: { containerPort: 5601 },
